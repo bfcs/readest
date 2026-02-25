@@ -76,4 +76,4 @@ jobs:
           releaseName: 'Readest ${{ inputs.tag_name }}'
           releaseDraft: false
           prerelease: false
-          args: '--target universal-apple-darwin'
+          args: '--target universal-apple-darwin --bundles dmg'
