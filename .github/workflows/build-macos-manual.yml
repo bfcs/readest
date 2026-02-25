@@ -61,6 +61,11 @@ jobs:
           echo "R2_REGION=${{ secrets.R2_REGION }}" >> .env.local
           cp .env.local apps/readest-app/.env.local
 
+      - name: disable tauri updater artifacts
+        run: |
+          cd apps/readest-app/src-tauri
+          node -e "const fs = require('fs'); const config = JSON.parse(fs.readFileSync('tauri.conf.json')); config.bundle.createUpdaterArtifacts = false; fs.writeFileSync('tauri.conf.json', JSON.stringify(config, null, 2));"
+
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
