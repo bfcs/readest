@@ -1,0 +1,86 @@
+name: Build Upstream Readest
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Upstream release tag name to build (e.g. v0.9.100, or leave empty for main)'
+        required: false
+        type: string
+        default: 'main'
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout upstream repository
+        uses: actions/checkout@v4
+        with:
+          repository: readest/readest
+          ref: ${{ inputs.tag_name }}
+          submodules: recursive
+
+      - name: setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: install dependencies
+        run: pnpm install
+
+      - name: copy pdfjs-dist and simplecc-dist to public directory
+        run: pnpm --filter @readest/readest-app setup-vendors
+
+      - name: install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-latest-macos-aarch64-cargo
+
+      - name: create .env.local file for Next.js
+        run: |
+          echo "NEXT_PUBLIC_POSTHOG_KEY=${{ secrets.NEXT_PUBLIC_POSTHOG_KEY }}" >> .env.local
+          echo "NEXT_PUBLIC_POSTHOG_HOST=${{ secrets.NEXT_PUBLIC_POSTHOG_HOST }}" >> .env.local
+          echo "NEXT_PUBLIC_SUPABASE_URL=${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}" >> .env.local
+          echo "NEXT_PUBLIC_SUPABASE_ANON_KEY=${{ secrets.NEXT_PUBLIC_SUPABASE_ANON_KEY }}" >> .env.local
+          echo "NEXT_PUBLIC_APP_PLATFORM=tauri" >> .env.local
+          echo "NEXT_PUBLIC_STORAGE_FIXED_QUOTA=${{ secrets.NEXT_PUBLIC_STORAGE_FIXED_QUOTA }}" >> .env.local
+          echo "NEXT_PUBLIC_API_BASE_URL=${{ secrets.NEXT_PUBLIC_API_BASE_URL }}" >> .env.local
+          echo "NEXT_PUBLIC_OBJECT_STORAGE_TYPE=${{ secrets.NEXT_PUBLIC_OBJECT_STORAGE_TYPE }}" >> .env.local
+          echo "R2_ACCESS_KEY_ID=${{ secrets.R2_ACCESS_KEY_ID }}" >> .env.local
+          echo "R2_SECRET_ACCESS_KEY=${{ secrets.R2_SECRET_ACCESS_KEY }}" >> .env.local
+          echo "R2_BUCKET_NAME=${{ secrets.R2_BUCKET_NAME }}" >> .env.local
+          echo "R2_ACCOUNT_ID=${{ secrets.R2_ACCOUNT_ID }}" >> .env.local
+          echo "R2_REGION=${{ secrets.R2_REGION }}" >> .env.local
+          cp .env.local apps/readest-app/.env.local
+
+      - name: disable tauri updater artifacts
+        run: |
+          cd apps/readest-app/src-tauri
+          node -e "const fs = require('fs'); const config = JSON.parse(fs.readFileSync('tauri.conf.json')); config.bundle.createUpdaterArtifacts = false; fs.writeFileSync('tauri.conf.json', JSON.stringify(config, null, 2));"
+
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NODE_OPTIONS: '--max-old-space-size=8192'
+        with:
+          projectPath: apps/readest-app
+          tagName: custom-${{ inputs.tag_name }}-${{ github.run_number }}
+          releaseName: 'Readest Custom Build ${{ inputs.tag_name }}'
+          releaseDraft: false
+          prerelease: false
+          args: '--target universal-apple-darwin --bundles dmg'
