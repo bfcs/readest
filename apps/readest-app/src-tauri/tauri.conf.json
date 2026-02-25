@@ -126,7 +126,7 @@
         "role": "Viewer"
       }
     ],
-    "createUpdaterArtifacts": true
+    "createUpdaterArtifacts": false
   },
   "plugins": {
     "fs": {
@@ -158,7 +158,11 @@
       ]
     },
     "deep-link": {
-      "mobile": [{ "host": "web.readest.com" }],
+      "mobile": [
+        {
+          "host": "web.readest.com"
+        }
+      ],
       "desktop": {
         "schemes": ["readest"]
       }
