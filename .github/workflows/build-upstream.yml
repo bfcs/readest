@@ -1,6 +1,9 @@
 name: Build Upstream Readest
 
 on:
+  schedule:
+    # 每月1日和15日午夜运行（约每两周运行一次）
+    - cron: '0 0 1,15 * *'
   workflow_dispatch:
     inputs:
       tag_name:
@@ -20,13 +23,11 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: readest/readest
-          ref: ${{ inputs.tag_name }}
+          ref: ${{ inputs.tag_name || 'main' }}
           submodules: recursive
 
       - name: setup pnpm
         uses: pnpm/action-setup@v4
-        with:
-          version: 9
 
       - name: setup node
         uses: actions/setup-node@v4
@@ -79,8 +80,8 @@ jobs:
           NODE_OPTIONS: '--max-old-space-size=8192'
         with:
           projectPath: apps/readest-app
-          tagName: custom-${{ inputs.tag_name }}-${{ github.run_number }}
-          releaseName: 'Readest Custom Build ${{ inputs.tag_name }}'
+          tagName: custom-${{ inputs.tag_name || 'main' }}-${{ github.run_number }}
+          releaseName: "Readest Custom Build ${{ inputs.tag_name || 'main' }}"
           releaseDraft: false
           prerelease: false
           args: '--target universal-apple-darwin --bundles dmg'
