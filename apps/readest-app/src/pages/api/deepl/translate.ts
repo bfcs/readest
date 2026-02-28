@@ -183,11 +183,21 @@ async function callDeepLAPI(
   // TODO: this should be processed in the client, but for now, we need to do it here
   // please remove this when most clients are updated
   const input = text.replaceAll('\n', '').trim();
-  const requestBody = {
+  const finalSourceLang = isV2Api ? sourceLang : (LANG_V2_V1_MAP[sourceLang] ?? sourceLang);
+  const finalTargetLang = isV2Api ? targetLang : (LANG_V2_V1_MAP[targetLang] ?? targetLang);
+
+  const requestBody: {
+    text: string | string[];
+    target_lang: string;
+    source_lang?: string;
+  } = {
     text: isV2Api ? [input] : input,
-    source_lang: isV2Api ? sourceLang : (LANG_V2_V1_MAP[sourceLang] ?? sourceLang),
-    target_lang: isV2Api ? targetLang : (LANG_V2_V1_MAP[targetLang] ?? targetLang),
+    target_lang: finalTargetLang,
   };
+
+  if (finalSourceLang && finalSourceLang.toUpperCase() !== 'AUTO') {
+    requestBody.source_lang = finalSourceLang;
+  }
 
   const response = await fetch(apiUrl, {
     method: 'POST',

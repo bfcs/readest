@@ -36,9 +36,10 @@ export const deeplProvider: TranslationProvider = {
       throw new Error('Authentication token is required for DeepL translation');
     }
 
+    const normalizedSourceLang = normalizeToShortLang(sourceLang).toUpperCase();
     const body = JSON.stringify({
       text: text,
-      source_lang: normalizeToShortLang(sourceLang).toUpperCase(),
+      ...(normalizedSourceLang !== 'AUTO' ? { source_lang: normalizedSourceLang } : {}),
       target_lang: normalizeToShortLang(targetLang).toUpperCase(),
       use_cache: useCache,
     });
