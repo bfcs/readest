@@ -84,6 +84,7 @@ CREATE TABLE public.files (
   file_key text NOT NULL,
   file_size bigint NOT NULL,
   created_at timestamp with time zone NULL DEFAULT now(),
+  updated_at timestamp with time zone NULL DEFAULT now(),
   deleted_at timestamp with time zone NULL,
   CONSTRAINT files_pkey PRIMARY KEY (id),
   CONSTRAINT files_file_key_key UNIQUE (file_key),
@@ -100,7 +101,130 @@ CREATE POLICY files_select ON public.files FOR SELECT USING (auth.uid() = user_i
 CREATE POLICY files_update ON public.files FOR UPDATE USING (auth.uid() = user_id) WITH CHECK (deleted_at IS NULL OR deleted_at > now());
 CREATE POLICY files_delete ON public.files FOR DELETE USING (auth.uid() = user_id);
 
+-- usage_stats table for translation quotas
+CREATE TABLE public.usage_stats (
+  id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
+  user_id uuid REFERENCES auth.users(id) ON DELETE CASCADE NOT NULL,
+  usage_type text NOT NULL,
+  usage_date date DEFAULT CURRENT_DATE NOT NULL,
+  period text DEFAULT 'daily' NOT NULL,
+  count bigint DEFAULT 0 NOT NULL,
+  metadata jsonb DEFAULT '{}'::jsonb,
+  updated_at timestamp with time zone DEFAULT now()
+);
+
+CREATE UNIQUE INDEX idx_usage_stats_unique ON public.usage_stats (user_id, usage_type, usage_date);
+
+ALTER TABLE public.usage_stats ENABLE ROW LEVEL SECURITY;
+CREATE POLICY select_usage_stats ON public.usage_stats FOR SELECT TO authenticated USING ((SELECT auth.uid()) = user_id);
+CREATE POLICY insert_usage_stats ON public.usage_stats FOR INSERT TO authenticated WITH CHECK ((SELECT auth.uid()) = user_id);
+CREATE POLICY update_usage_stats ON public.usage_stats FOR UPDATE TO authenticated USING ((SELECT auth.uid()) = user_id);
+
+-- Functions
+CREATE OR REPLACE FUNCTION public.get_storage_by_book_hash(p_user_id uuid)
+RETURNS TABLE (
+  book_hash text,
+  total_size bigint,
+  file_count bigint
+) 
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+BEGIN
+  RETURN QUERY
+  SELECT 
+    f.book_hash,
+    SUM(f.file_size)::bigint,
+    COUNT(*)::bigint
+  FROM public.files f
+  WHERE f.user_id = p_user_id AND f.deleted_at IS NULL
+  GROUP BY f.book_hash;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.get_storage_stats(p_user_id uuid)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+  v_total_size bigint;
+  v_file_count int;
+BEGIN
+  SELECT COALESCE(SUM(file_size), 0), COUNT(*)
+  INTO v_total_size, v_file_count
+  FROM public.files
+  WHERE user_id = p_user_id AND deleted_at IS NULL;
+
+  RETURN jsonb_build_object(
+    'total_size', v_total_size,
+    'file_count', v_file_count
+  );
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.increment_daily_usage(
+  p_user_id uuid,
+  p_usage_type text,
+  p_usage_date date,
+  p_increment bigint,
+  p_metadata jsonb DEFAULT '{}'::jsonb
+)
+RETURNS bigint 
+LANGUAGE plpgsql 
+SECURITY DEFINER 
+AS $$
+DECLARE 
+  v_new_count bigint;
+BEGIN
+  INSERT INTO public.usage_stats (user_id, usage_type, usage_date, count, metadata)
+  VALUES (p_user_id, p_usage_type, p_usage_date, p_increment, p_metadata)
+  ON CONFLICT (user_id, usage_type, usage_date) 
+  DO UPDATE SET 
+    count = usage_stats.count + p_increment, 
+    metadata = usage_stats.metadata || p_metadata, 
+    updated_at = now()
+  RETURNING count INTO v_new_count;
+  RETURN v_new_count;
+END; 
+$$;
+
+CREATE OR REPLACE FUNCTION public.get_current_usage(
+  p_user_id uuid,
+  p_usage_type text,
+  p_period text DEFAULT 'daily'
+)
+RETURNS bigint 
+LANGUAGE plpgsql 
+SECURITY DEFINER 
+AS $$
+DECLARE 
+  v_total bigint;
+BEGIN
+  IF p_period = 'daily' THEN 
+    SELECT COALESCE(SUM(count), 0) INTO v_total 
+    FROM public.usage_stats 
+    WHERE user_id = p_user_id AND usage_type = p_usage_type AND usage_date = CURRENT_DATE;
+  ELSIF p_period = 'monthly' THEN 
+    SELECT COALESCE(SUM(count), 0) INTO v_total 
+    FROM public.usage_stats 
+    WHERE user_id = p_user_id AND usage_type = p_usage_type AND usage_date >= date_trunc('month', CURRENT_DATE)::date;
+  ELSE 
+    v_total := 0; 
+  END IF;
+  RETURN v_total;
+END; 
+$$;
+
+-- Grants
 GRANT ALL ON public.books TO authenticated;
 GRANT ALL ON public.book_configs TO authenticated;
 GRANT ALL ON public.book_notes TO authenticated;
 GRANT ALL ON public.files TO authenticated;
+GRANT ALL ON public.usage_stats TO authenticated;
+GRANT ALL ON public.usage_stats TO service_role;
+
+GRANT EXECUTE ON FUNCTION public.get_storage_by_book_hash TO authenticated;
+GRANT EXECUTE ON FUNCTION public.get_storage_stats TO authenticated;
+GRANT EXECUTE ON FUNCTION public.get_current_usage TO authenticated;
+GRANT EXECUTE ON FUNCTION public.increment_daily_usage TO authenticated;
