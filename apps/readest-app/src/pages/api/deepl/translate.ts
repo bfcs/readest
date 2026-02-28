@@ -104,10 +104,10 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
 
   const {
     text,
-    source_lang: sourceLang = 'AUTO',
+    source_lang: sourceLang,
     target_lang: targetLang = 'EN',
     use_cache: useCache = false,
-  }: { text: string[]; source_lang: string; target_lang: string; use_cache: boolean } = req.body;
+  }: { text: string[]; source_lang?: string; target_lang: string; use_cache: boolean } = req.body;
 
   try {
     const translations = await Promise.all(
@@ -117,7 +117,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
         }
         if (useCache && hasKVCache) {
           try {
-            const cacheKey = generateCacheKey(singleText, sourceLang, targetLang);
+            const cacheKey = generateCacheKey(singleText, sourceLang || 'AUTO', targetLang);
             const cachedTranslation = await env['TRANSLATIONS_KV']!.get(cacheKey);
 
             if (cachedTranslation) {
@@ -137,7 +137,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
 
         return await callDeepLAPI(
           singleText,
-          sourceLang,
+          sourceLang || 'AUTO',
           targetLang,
           deeplApiUrl,
           deeplAuthKey,
@@ -183,11 +183,18 @@ async function callDeepLAPI(
   // TODO: this should be processed in the client, but for now, we need to do it here
   // please remove this when most clients are updated
   const input = text.replaceAll('\n', '').trim();
-  const requestBody = {
+  const requestBody: {
+    text: string | string[];
+    target_lang: string;
+    source_lang?: string;
+  } = {
     text: isV2Api ? [input] : input,
-    source_lang: isV2Api ? sourceLang : (LANG_V2_V1_MAP[sourceLang] ?? sourceLang),
     target_lang: isV2Api ? targetLang : (LANG_V2_V1_MAP[targetLang] ?? targetLang),
   };
+
+  if (sourceLang && sourceLang !== 'AUTO') {
+    requestBody.source_lang = isV2Api ? sourceLang : (LANG_V2_V1_MAP[sourceLang] ?? sourceLang);
+  }
 
   const response = await fetch(apiUrl, {
     method: 'POST',
@@ -221,7 +228,7 @@ async function callDeepLAPI(
 
   if (useCache && translationsKV && translatedText) {
     try {
-      const cacheKey = generateCacheKey(text, sourceLang, targetLang);
+      const cacheKey = generateCacheKey(text, sourceLang || 'AUTO', targetLang);
       await translationsKV.put(cacheKey, translatedText, { expirationTtl: 86400 * 90 });
     } catch (cacheError) {
       console.error('Cache storage error:', cacheError);
