@@ -83,7 +83,12 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
-  const env = (getCloudflareContext().env || {}) as CloudflareEnv;
+  let env: Partial<CloudflareEnv> = {};
+  try {
+    env = (getCloudflareContext().env || {}) as CloudflareEnv;
+  } catch (error) {
+    console.warn('Cloudflare context is not available. Skipping KV cache.');
+  }
   const hasKVCache = !!env['TRANSLATIONS_KV'];
 
   const { user, token } = await validateUserAndToken(req.headers['authorization']);
