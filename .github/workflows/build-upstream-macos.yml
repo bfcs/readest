@@ -100,7 +100,12 @@ jobs:
       - name: Checkout target
         if: env.SKIP_BUILD != 'true'
         run: |
-          git checkout ${{ env.TARGET_TAG }}
+          TARGET=${{ env.TARGET_TAG }}
+          if [ "$TARGET" == "main" ] || [ "$TARGET" == "master" ]; then
+            git checkout upstream/$TARGET
+          else
+            git checkout $TARGET
+          fi
           git submodule update --init --recursive
 
       - name: setup pnpm
