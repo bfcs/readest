@@ -1,0 +1,273 @@
+name: Build Upstream iOS App
+
+on:
+  schedule:
+    # 每月1日和15日午夜运行（约每两周运行一次）
+    - cron: '0 0 1,15 * *'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Upstream release tag name to build (e.g. v0.9.100, or leave empty for latest upstream release)'
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  build-ios:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout fork repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.PAT_TOKEN || github.token }}
+
+      - name: Sync upstream to fork
+        run: |
+          if [ "${{ github.repository }}" != "readest/readest" ]; then
+            git config --global user.name "github-actions[bot]"
+            git config --global user.email "github-actions[bot]@users.noreply.github.com"
+            git remote add upstream https://github.com/readest/readest.git
+            git fetch upstream
+            git checkout main
+            
+            # 备份你要保留的两个自定义持续集成脚本
+            cp .github/workflows/build-upstream-macos.yml /tmp/
+            cp .github/workflows/build-upstream-ios.yml /tmp/
+            
+            # 终极奥义：强制丢弃你 fork 中产生的所有历史杂项，完全 100% 重置为上游官方状态
+            git reset --hard upstream/main
+            
+            # 恢复你的两个自定义脚本
+            mkdir -p .github/workflows
+            cp /tmp/build-upstream-macos.yml .github/workflows/
+            cp /tmp/build-upstream-ios.yml .github/workflows/
+            
+            # 将恢复出来的脚本挂在官方最新代码之上并强制推送
+            git add .github/workflows/build-upstream-macos.yml .github/workflows/build-upstream-ios.yml
+            if ! git diff --cached --quiet; then
+              git commit -m "chore: force sync with upstream and keep custom workflows"
+            fi
+            
+            git push origin main --force
+            git push origin --tags --force
+          fi
+
+      - name: Determine target tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          INPUT_TAG="${{ inputs.tag_name }}"
+          # Treat empty or literal 'latest' as "auto-detect from upstream"
+          if [ -z "$INPUT_TAG" ] || [ "$INPUT_TAG" == "latest" ]; then
+            API_RESPONSE=$(curl -sL -H "Authorization: Bearer $GH_TOKEN" \
+              https://api.github.com/repos/readest/readest/releases/latest)
+            LATEST_TAG=$(echo "$API_RESPONSE" | jq -r .tag_name)
+            echo "API response tag_name: $LATEST_TAG"
+            if [ "$LATEST_TAG" == "null" ] || [ -z "$LATEST_TAG" ]; then
+              echo "ERROR: GitHub API returned null or empty tag. Response:"
+              echo "$API_RESPONSE" | head -20
+              exit 1
+            fi
+            echo "TARGET_TAG=$LATEST_TAG" >> $GITHUB_ENV
+            echo "Auto-detected latest upstream tag: $LATEST_TAG"
+          else
+            echo "TARGET_TAG=$INPUT_TAG" >> $GITHUB_ENV
+            echo "Using specified target: $INPUT_TAG"
+          fi
+
+      - name: Check if build exists in R2
+        id: check_build
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          R2_BUCKET: ${{ secrets.R2_BUCKET_NAME || 'readest' }}
+        run: |
+          TARGET=${{ env.TARGET_TAG }}
+          if aws s3 ls "s3://${R2_BUCKET}/releases/Readest_${TARGET}.ipa" --endpoint-url "$R2_ENDPOINT" 2>/dev/null; then
+            echo "SKIP_BUILD=true" >> $GITHUB_ENV
+            echo "Build for ${TARGET} already exists in R2. Skipping."
+          else
+            echo "SKIP_BUILD=false" >> $GITHUB_ENV
+            echo "Proceeding with build for ${TARGET}."
+          fi
+
+      - name: Checkout target
+        if: env.SKIP_BUILD != 'true'
+        run: |
+          TARGET=${{ env.TARGET_TAG }}
+          if [ "$TARGET" == "main" ] || [ "$TARGET" == "master" ]; then
+            git checkout upstream/$TARGET
+          else
+            git checkout $TARGET
+          fi
+          git submodule update --init --recursive
+
+      - name: setup pnpm
+        if: env.SKIP_BUILD != 'true'
+        uses: pnpm/action-setup@v4
+
+      - name: setup node
+        if: env.SKIP_BUILD != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: install dependencies
+        if: env.SKIP_BUILD != 'true'
+        run: pnpm install
+
+      - name: copy vendors
+        if: env.SKIP_BUILD != 'true'
+        run: |
+          # The package.json relative paths are set to run when PWD is set correctly
+          cd apps/readest-app
+          pnpm setup-vendors
+
+      - name: install Rust stable
+        if: env.SKIP_BUILD != 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,x86_64-apple-ios
+
+      - name: Rust cache
+        if: env.SKIP_BUILD != 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-latest-macos-aarch64-cargo
+
+      - name: create .env.local file for Next.js
+        if: env.SKIP_BUILD != 'true'
+        run: |
+          echo "NEXT_PUBLIC_POSTHOG_KEY=${{ secrets.NEXT_PUBLIC_POSTHOG_KEY }}" >> .env.local
+          echo "NEXT_PUBLIC_POSTHOG_HOST=${{ secrets.NEXT_PUBLIC_POSTHOG_HOST }}" >> .env.local
+          echo "NEXT_PUBLIC_SUPABASE_URL=${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}" >> .env.local
+          echo "NEXT_PUBLIC_SUPABASE_ANON_KEY=${{ secrets.NEXT_PUBLIC_SUPABASE_ANON_KEY }}" >> .env.local
+          echo "NEXT_PUBLIC_APP_PLATFORM=tauri" >> .env.local
+          echo "NEXT_PUBLIC_STORAGE_FIXED_QUOTA=${{ secrets.NEXT_PUBLIC_STORAGE_FIXED_QUOTA }}" >> .env.local
+          echo "NEXT_PUBLIC_TRANSLATION_FIXED_QUOTA=${{ secrets.NEXT_PUBLIC_TRANSLATION_FIXED_QUOTA }}" >> .env.local
+          echo "NEXT_PUBLIC_API_BASE_URL=${{ secrets.NEXT_PUBLIC_API_BASE_URL }}" >> .env.local
+          echo "NEXT_PUBLIC_OBJECT_STORAGE_TYPE=${{ secrets.NEXT_PUBLIC_OBJECT_STORAGE_TYPE }}" >> .env.local
+          echo "NEXT_PUBLIC_DIST_CHANNEL=appstore" >> .env.local
+          echo "R2_ACCESS_KEY_ID=${{ secrets.R2_ACCESS_KEY_ID }}" >> .env.local
+          echo "R2_SECRET_ACCESS_KEY=${{ secrets.R2_SECRET_ACCESS_KEY }}" >> .env.local
+          echo "R2_BUCKET_NAME=${{ secrets.R2_BUCKET_NAME || 'readest' }}" >> .env.local
+          echo "R2_ACCOUNT_ID=${{ secrets.R2_ACCOUNT_ID }}" >> .env.local
+          echo "R2_REGION=${{ secrets.R2_REGION }}" >> .env.local
+          cp .env.local apps/readest-app/.env.local
+
+          # Also export NEXT_PUBLIC_* vars as system env vars so webpack DefinePlugin
+          # can inline them at compile time regardless of dotenv-cli or Next.js .env loading
+          echo "NEXT_PUBLIC_DIST_CHANNEL=appstore" >> $GITHUB_ENV
+          echo "NEXT_PUBLIC_APP_PLATFORM=tauri" >> $GITHUB_ENV
+          echo "NEXT_PUBLIC_SUPABASE_URL=${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}" >> $GITHUB_ENV
+          echo "NEXT_PUBLIC_SUPABASE_ANON_KEY=${{ secrets.NEXT_PUBLIC_SUPABASE_ANON_KEY }}" >> $GITHUB_ENV
+          echo "NEXT_PUBLIC_STORAGE_FIXED_QUOTA=${{ secrets.NEXT_PUBLIC_STORAGE_FIXED_QUOTA }}" >> $GITHUB_ENV
+          echo "NEXT_PUBLIC_TRANSLATION_FIXED_QUOTA=${{ secrets.NEXT_PUBLIC_TRANSLATION_FIXED_QUOTA }}" >> $GITHUB_ENV
+          echo "NEXT_PUBLIC_API_BASE_URL=${{ secrets.NEXT_PUBLIC_API_BASE_URL }}" >> $GITHUB_ENV
+          echo "NEXT_PUBLIC_OBJECT_STORAGE_TYPE=${{ secrets.NEXT_PUBLIC_OBJECT_STORAGE_TYPE }}" >> $GITHUB_ENV
+          echo "NEXT_PUBLIC_POSTHOG_KEY=${{ secrets.NEXT_PUBLIC_POSTHOG_KEY }}" >> $GITHUB_ENV
+          echo "NEXT_PUBLIC_POSTHOG_HOST=${{ secrets.NEXT_PUBLIC_POSTHOG_HOST }}" >> $GITHUB_ENV
+
+      - name: Initialize Tauri iOS project and strip code signing
+        if: env.SKIP_BUILD != 'true'
+        run: |
+          cd apps/readest-app
+          brew install xcodegen
+          pnpm tauri ios init
+
+          # Force remove development team and set code signing to NO in xcodegen project.yml
+          sed -i '' -e 's/DEVELOPMENT_TEAM: .*/DEVELOPMENT_TEAM: ""/g' src-tauri/gen/apple/project.yml
+          sed -i '' -e 's/ENABLE_BITCODE: false/ENABLE_BITCODE: false\n        CODE_SIGNING_ALLOWED: false\n        CODE_SIGNING_REQUIRED: false\n        CODE_SIGN_IDENTITY: ""/g' src-tauri/gen/apple/project.yml
+
+          # Regenerate icon assets: tauri ios init generates placeholder icons, override with real ones
+          # Try 1024x1024 first, fall back to the largest available
+          ICON_SRC=$(ls src-tauri/icons/1024x1024.png src-tauri/icons/128x128@2x.png 2>/dev/null | head -n 1)
+          if [ -n "$ICON_SRC" ]; then
+            pnpm tauri icon "$ICON_SRC" || true
+          fi
+
+          # Regenerate Xcode project with modifications
+          xcodegen -s src-tauri/gen/apple/project.yml --project src-tauri/gen/apple/
+
+      - name: disable tauri updater artifacts
+        if: env.SKIP_BUILD != 'true'
+        run: |
+          cd apps/readest-app/src-tauri
+          node -e "const fs = require('fs'); const config = JSON.parse(fs.readFileSync('tauri.conf.json')); config.bundle.createUpdaterArtifacts = false; fs.writeFileSync('tauri.conf.json', JSON.stringify(config, null, 2));"
+
+      - name: Compile frontend and Rust components via Tauri
+        if: env.SKIP_BUILD != 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NODE_OPTIONS: '--max-old-space-size=8192'
+          NEXT_PUBLIC_DIST_CHANNEL: appstore
+          NEXT_PUBLIC_APP_PLATFORM: tauri
+          NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
+          NEXT_PUBLIC_STORAGE_FIXED_QUOTA: ${{ secrets.NEXT_PUBLIC_STORAGE_FIXED_QUOTA }}
+          NEXT_PUBLIC_TRANSLATION_FIXED_QUOTA: ${{ secrets.NEXT_PUBLIC_TRANSLATION_FIXED_QUOTA }}
+          NEXT_PUBLIC_API_BASE_URL: ${{ secrets.NEXT_PUBLIC_API_BASE_URL }}
+          NEXT_PUBLIC_OBJECT_STORAGE_TYPE: ${{ secrets.NEXT_PUBLIC_OBJECT_STORAGE_TYPE }}
+          NEXT_PUBLIC_POSTHOG_KEY: ${{ secrets.NEXT_PUBLIC_POSTHOG_KEY }}
+          NEXT_PUBLIC_POSTHOG_HOST: ${{ secrets.NEXT_PUBLIC_POSTHOG_HOST }}
+        run: |
+          cd apps/readest-app
+          mkdir -p build/Payload
+
+          # pnpm tauri ios build starts the WebSocket server needed by Xcode pre-build script.
+          # tauri ios xcode-script connects to this WebSocket to compile Rust.
+          # Code signing is disabled via project.yml (xcodegen-patched).
+          # Archive/export will fail (no cert) but is fine - .app lives in DerivedData.
+          pnpm tauri ios build --ci || true
+
+          # Verify DIST_CHANNEL was compiled into the frontend bundle
+          echo "=== Checking DIST_CHANNEL in compiled output ==="
+          grep -r "appstore" out/_next/static/chunks/ 2>/dev/null | head -5 || echo "WARNING: 'appstore' not found in compiled chunks"
+          grep -r "canCustomizeRootDir" out/_next/static/chunks/ 2>/dev/null | head -3 || true
+
+          # Strategy 1: find Release/release-iphoneos build product (case-insensitive)
+          APP_PATH=$(find ~/Library/Developer/Xcode/DerivedData -ipath "*/release-iphoneos/Readest.app" -type d 2>/dev/null | head -n 1)
+
+          # Strategy 2: fall back to xcarchive if Strategy 1 didn't produce a real app
+          if [ -z "$APP_PATH" ]; then
+            ARCHIVE=$(find ~/Library/Developer/Xcode/Archives -name "Readest.xcarchive" -type d 2>/dev/null | sort -r | head -n 1)
+            if [ -n "$ARCHIVE" ]; then
+              APP_PATH="$ARCHIVE/Products/Applications/Readest.app"
+            fi
+          fi
+
+          if [ -z "$APP_PATH" ] || [ ! -d "$APP_PATH" ]; then
+            echo "=== DerivedData contents ==="
+            find ~/Library/Developer/Xcode/DerivedData -name "Readest.app" -type d 2>/dev/null
+            echo "Failed to find a valid Readest.app!"
+            exit 1
+          fi
+
+          echo "Found app at: $APP_PATH"
+          du -sh "$APP_PATH"
+          cp -R "$APP_PATH" build/Payload/
+          cd build
+          zip -qr Readest_${{ env.TARGET_TAG }}.ipa Payload
+          du -sh Readest_${{ env.TARGET_TAG }}.ipa
+
+      - name: Upload IPA to R2
+        if: env.SKIP_BUILD != 'true'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          R2_BUCKET: ${{ secrets.R2_BUCKET_NAME || 'readest' }}
+          TARGET_TAG: ${{ env.TARGET_TAG }}
+        run: |
+          # 删除旧版本 IPA
+          aws s3 rm "s3://${R2_BUCKET}/releases/" --recursive --exclude "*" --include "Readest_*.ipa" --endpoint-url "$R2_ENDPOINT" || true
+          # 上传新 IPA
+          aws s3 cp "apps/readest-app/build/Readest_${TARGET_TAG}.ipa" "s3://${R2_BUCKET}/releases/Readest_${TARGET_TAG}.ipa" --endpoint-url "$R2_ENDPOINT"
