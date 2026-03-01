@@ -86,7 +86,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   let env: Partial<CloudflareEnv> = {};
   try {
     env = (getCloudflareContext().env || {}) as CloudflareEnv;
-  } catch (error) {
+  } catch {
     console.warn('Cloudflare context is not available. Skipping KV cache.');
   }
   const hasKVCache = !!env['TRANSLATIONS_KV'];
