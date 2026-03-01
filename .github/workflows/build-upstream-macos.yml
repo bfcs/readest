@@ -1,0 +1,193 @@
+name: Build Upstream MacOS
+
+on:
+  schedule:
+    # 每月1日和15日午夜运行（约每两周运行一次）
+    - cron: '0 0 1,15 * *'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Upstream release tag name to build (e.g. v0.9.100, or leave empty for latest upstream release)'
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout fork repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.PAT_TOKEN || github.token }}
+
+      - name: Sync upstream to fork
+        run: |
+          if [ "${{ github.repository }}" != "readest/readest" ]; then
+            git config --global user.name "github-actions[bot]"
+            git config --global user.email "github-actions[bot]@users.noreply.github.com"
+            git remote add upstream https://github.com/readest/readest.git
+            git fetch upstream
+            git checkout main
+            
+            # 备份你要保留的两个自定义持续集成脚本
+            cp .github/workflows/build-upstream-macos.yml /tmp/
+            cp .github/workflows/build-upstream-ios.yml /tmp/
+            
+            # 终极奥义：强制丢弃你 fork 中产生的所有历史杂项，完全 100% 重置为上游官方状态
+            git reset --hard upstream/main
+            
+            # 恢复你的两个自定义脚本
+            mkdir -p .github/workflows
+            cp /tmp/build-upstream-macos.yml .github/workflows/
+            cp /tmp/build-upstream-ios.yml .github/workflows/
+            
+            # 将恢复出来的脚本挂在官方最新代码之上并强制推送
+            git add .github/workflows/build-upstream-macos.yml .github/workflows/build-upstream-ios.yml
+            if ! git diff --cached --quiet; then
+              git commit -m "chore: force sync with upstream and keep custom workflows"
+            fi
+            
+            git push origin main --force
+            git push origin --tags --force
+          fi
+
+      - name: Determine target tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          INPUT_TAG="${{ inputs.tag_name }}"
+          # Treat empty or literal 'latest' as "auto-detect from upstream"
+          if [ -z "$INPUT_TAG" ] || [ "$INPUT_TAG" == "latest" ]; then
+            API_RESPONSE=$(curl -sL -H "Authorization: Bearer $GH_TOKEN" \
+              https://api.github.com/repos/readest/readest/releases/latest)
+            LATEST_TAG=$(echo "$API_RESPONSE" | jq -r .tag_name)
+            echo "API response tag_name: $LATEST_TAG"
+            if [ "$LATEST_TAG" == "null" ] || [ -z "$LATEST_TAG" ]; then
+              echo "ERROR: GitHub API returned null or empty tag. Response:"
+              echo "$API_RESPONSE" | head -20
+              exit 1
+            fi
+            echo "TARGET_TAG=$LATEST_TAG" >> $GITHUB_ENV
+            echo "Auto-detected latest upstream tag: $LATEST_TAG"
+          else
+            echo "TARGET_TAG=$INPUT_TAG" >> $GITHUB_ENV
+            echo "Using specified target: $INPUT_TAG"
+          fi
+
+      - name: Check if build exists in R2
+        id: check_build
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          R2_BUCKET: ${{ secrets.R2_BUCKET_NAME || 'readest' }}
+        run: |
+          TARGET=${{ env.TARGET_TAG }}
+          if aws s3 ls "s3://${R2_BUCKET}/releases/Readest_${TARGET}.dmg" --endpoint-url "$R2_ENDPOINT" 2>/dev/null; then
+            echo "SKIP_BUILD=true" >> $GITHUB_ENV
+            echo "Build for ${TARGET} already exists in R2. Skipping."
+          else
+            echo "SKIP_BUILD=false" >> $GITHUB_ENV
+            echo "Proceeding with build for ${TARGET}."
+          fi
+
+      - name: Checkout target
+        if: env.SKIP_BUILD != 'true'
+        run: |
+          git checkout ${{ env.TARGET_TAG }}
+          git submodule update --init --recursive
+
+      - name: setup pnpm
+        if: env.SKIP_BUILD != 'true'
+        uses: pnpm/action-setup@v4
+
+      - name: setup node
+        if: env.SKIP_BUILD != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: install dependencies
+        if: env.SKIP_BUILD != 'true'
+        run: pnpm install
+
+      - name: copy pdfjs-dist and simplecc-dist to public directory
+        if: env.SKIP_BUILD != 'true'
+        run: pnpm --filter @readest/readest-app setup-vendors
+
+      - name: install Rust stable
+        if: env.SKIP_BUILD != 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Rust cache
+        if: env.SKIP_BUILD != 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-latest-macos-aarch64-cargo
+
+      - name: create .env.local file for Next.js
+        if: env.SKIP_BUILD != 'true'
+        run: |
+          echo "NEXT_PUBLIC_POSTHOG_KEY=${{ secrets.NEXT_PUBLIC_POSTHOG_KEY }}" >> .env.local
+          echo "NEXT_PUBLIC_POSTHOG_HOST=${{ secrets.NEXT_PUBLIC_POSTHOG_HOST }}" >> .env.local
+          echo "NEXT_PUBLIC_SUPABASE_URL=${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}" >> .env.local
+          echo "NEXT_PUBLIC_SUPABASE_ANON_KEY=${{ secrets.NEXT_PUBLIC_SUPABASE_ANON_KEY }}" >> .env.local
+          echo "NEXT_PUBLIC_APP_PLATFORM=tauri" >> .env.local
+          echo "NEXT_PUBLIC_STORAGE_FIXED_QUOTA=${{ secrets.NEXT_PUBLIC_STORAGE_FIXED_QUOTA }}" >> .env.local
+          echo "NEXT_PUBLIC_TRANSLATION_FIXED_QUOTA=${{ secrets.NEXT_PUBLIC_TRANSLATION_FIXED_QUOTA }}" >> .env.local
+          echo "NEXT_PUBLIC_API_BASE_URL=${{ secrets.NEXT_PUBLIC_API_BASE_URL }}" >> .env.local
+          echo "NEXT_PUBLIC_OBJECT_STORAGE_TYPE=${{ secrets.NEXT_PUBLIC_OBJECT_STORAGE_TYPE }}" >> .env.local
+          echo "R2_ACCESS_KEY_ID=${{ secrets.R2_ACCESS_KEY_ID }}" >> .env.local
+          echo "R2_SECRET_ACCESS_KEY=${{ secrets.R2_SECRET_ACCESS_KEY }}" >> .env.local
+          echo "R2_BUCKET_NAME=${{ secrets.R2_BUCKET_NAME || 'readest' }}" >> .env.local
+          echo "R2_ACCOUNT_ID=${{ secrets.R2_ACCOUNT_ID }}" >> .env.local
+          echo "R2_REGION=${{ secrets.R2_REGION }}" >> .env.local
+          cp .env.local apps/readest-app/.env.local
+
+      - name: disable tauri updater artifacts
+        if: env.SKIP_BUILD != 'true'
+        run: |
+          cd apps/readest-app/src-tauri
+          node -e "const fs = require('fs'); const config = JSON.parse(fs.readFileSync('tauri.conf.json')); config.bundle.createUpdaterArtifacts = false; fs.writeFileSync('tauri.conf.json', JSON.stringify(config, null, 2));"
+
+      - name: Build MacOS App (Unsigned)
+        if: env.SKIP_BUILD != 'true'
+        env:
+          NODE_OPTIONS: '--max-old-space-size=8192'
+        run: |
+          cd apps/readest-app
+          pnpm tauri build --target universal-apple-darwin --bundles dmg
+
+      - name: Upload DMG to R2
+        if: env.SKIP_BUILD != 'true'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          R2_BUCKET: ${{ secrets.R2_BUCKET_NAME || 'readest' }}
+          TARGET_TAG: ${{ env.TARGET_TAG }}
+        run: |
+          # Search broadly in the entire target directory for any DMG
+          DMG_PATH=$(find target -name "*.dmg" 2>/dev/null | head -n 1)
+          if [ -z "$DMG_PATH" ]; then
+            echo "=== DMG not found, listing bundle directories ==="
+            find target -type d -name "bundle" 2>/dev/null
+            find target -type d -name "dmg" 2>/dev/null
+            exit 1
+          fi
+          echo "Found DMG at: $DMG_PATH"
+          du -sh "$DMG_PATH"
+          # 删除旧版本 DMG
+          aws s3 rm "s3://${R2_BUCKET}/releases/" --recursive --exclude "*" --include "Readest_*.dmg" --endpoint-url "$R2_ENDPOINT" || true
+          # 上传新 DMG
+          aws s3 cp "$DMG_PATH" "s3://${R2_BUCKET}/releases/Readest_${TARGET_TAG}.dmg" --endpoint-url "$R2_ENDPOINT"
