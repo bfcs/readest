@@ -191,10 +191,10 @@ async function callDeepLAPI(
   } = {
     text: isV2Api ? [input] : input,
     source_lang: isV2Api ? sourceLang : (LANG_V2_V1_MAP[sourceLang] ?? sourceLang),
-    target_lang: isV2Api ? targetLang : (LANG_V2_V1_MAP[targetLang] ?? targetLang),
+    target_lang: LANG_V2_V1_MAP[targetLang] ?? targetLang,
   };
 
-  if (isV2Api && requestBody.source_lang?.toUpperCase() === 'AUTO') {
+  if (requestBody.source_lang?.toUpperCase() === 'AUTO') {
     delete requestBody.source_lang;
   }
 
