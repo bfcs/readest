@@ -1,0 +1,233 @@
+name: Build Upstream Android
+
+on:
+  schedule:
+    # 每月1日和15日午夜运行（约每两周运行一次）
+    - cron: '0 0 1,15 * *'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Upstream release tag name to build (e.g. v0.9.100, or leave empty for latest upstream release)'
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout fork repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.PAT_TOKEN || github.token }}
+
+      - name: Sync upstream to fork
+        run: |
+          if [ "${{ github.repository }}" != "readest/readest" ]; then
+            git config --global user.name "github-actions[bot]"
+            git config --global user.email "github-actions[bot]@users.noreply.github.com"
+            git remote add upstream https://github.com/readest/readest.git
+            git fetch upstream
+            git checkout main
+            
+            # 备份你要保留的自定义持续集成脚本
+            cp .github/workflows/build-upstream-*.yml /tmp/
+            
+            # 终极奥义：强制丢弃你 fork 中产生的所有历史杂项，完全 100% 重置为上游官方状态
+            git reset --hard upstream/main
+            
+            # 恢复你的自定义脚本
+            mkdir -p .github/workflows
+            cp /tmp/build-upstream-*.yml .github/workflows/
+            
+            # 将恢复出来的脚本挂在官方最新代码之上并强制推送
+            git add .github/workflows/build-upstream-*.yml
+            if ! git diff --cached --quiet; then
+              git commit -m "chore: force sync with upstream and keep custom workflows"
+            fi
+            
+            git push origin main --force
+            git push origin --tags --force
+          fi
+
+      - name: Determine target tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          INPUT_TAG="${{ inputs.tag_name }}"
+          # Treat empty or literal 'latest' as "auto-detect from upstream"
+          if [ -z "$INPUT_TAG" ] || [ "$INPUT_TAG" == "latest" ]; then
+            API_RESPONSE=$(curl -sL -H "Authorization: Bearer $GH_TOKEN" \
+              https://api.github.com/repos/readest/readest/releases/latest)
+            LATEST_TAG=$(echo "$API_RESPONSE" | jq -r .tag_name)
+            echo "API response tag_name: $LATEST_TAG"
+            if [ "$LATEST_TAG" == "null" ] || [ -z "$LATEST_TAG" ]; then
+              echo "ERROR: GitHub API returned null or empty tag. Response:"
+              echo "$API_RESPONSE" | head -20
+              exit 1
+            fi
+            echo "TARGET_TAG=$LATEST_TAG" >> $GITHUB_ENV
+            echo "Auto-detected latest upstream tag: $LATEST_TAG"
+          else
+            echo "TARGET_TAG=$INPUT_TAG" >> $GITHUB_ENV
+            echo "Using specified target: $INPUT_TAG"
+          fi
+
+      - name: Check if build exists in R2
+        id: check_build
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          R2_BUCKET: ${{ secrets.R2_BUCKET_NAME || 'readest' }}
+        run: |
+          TARGET=${{ env.TARGET_TAG }}
+          if aws s3 ls "s3://${R2_BUCKET}/releases/Readest_${TARGET}_universal.apk" --endpoint-url "$R2_ENDPOINT" 2>/dev/null; then
+            echo "SKIP_BUILD=true" >> $GITHUB_ENV
+            echo "Build for ${TARGET} already exists in R2. Skipping."
+          else
+            echo "SKIP_BUILD=false" >> $GITHUB_ENV
+            echo "Proceeding with build for ${TARGET}."
+          fi
+
+      - name: Checkout target
+        if: env.SKIP_BUILD != 'true'
+        run: |
+          TARGET=${{ env.TARGET_TAG }}
+          if [ "$TARGET" == "main" ] || [ "$TARGET" == "master" ]; then
+            git checkout upstream/$TARGET
+          else
+            git checkout $TARGET
+          fi
+          git submodule update --init --recursive
+
+      - name: setup pnpm
+        if: env.SKIP_BUILD != 'true'
+        uses: pnpm/action-setup@v4
+
+      - name: setup node
+        if: env.SKIP_BUILD != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: setup Java
+        if: env.SKIP_BUILD != 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: setup Android SDK
+        if: env.SKIP_BUILD != 'true'
+        uses: android-actions/setup-android@v3
+
+      - name: install NDK
+        if: env.SKIP_BUILD != 'true'
+        run: sdkmanager "ndk;28.2.13676358"
+
+      - name: install dependencies
+        if: env.SKIP_BUILD != 'true'
+        run: pnpm install
+
+      - name: copy pdfjs-dist and simplecc-dist to public directory
+        if: env.SKIP_BUILD != 'true'
+        run: pnpm --filter @readest/readest-app setup-vendors
+
+      - name: install Rust stable
+        if: env.SKIP_BUILD != 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+
+      - name: Rust cache
+        if: env.SKIP_BUILD != 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ubuntu-latest-android-cargo
+
+      - name: create .env.local file for Next.js
+        if: env.SKIP_BUILD != 'true'
+        run: |
+          echo "NEXT_PUBLIC_POSTHOG_KEY=${{ secrets.NEXT_PUBLIC_POSTHOG_KEY }}" >> .env.local
+          echo "NEXT_PUBLIC_POSTHOG_HOST=${{ secrets.NEXT_PUBLIC_POSTHOG_HOST }}" >> .env.local
+          echo "NEXT_PUBLIC_SUPABASE_URL=${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}" >> .env.local
+          echo "NEXT_PUBLIC_SUPABASE_ANON_KEY=${{ secrets.NEXT_PUBLIC_SUPABASE_ANON_KEY }}" >> .env.local
+          echo "NEXT_PUBLIC_APP_PLATFORM=tauri" >> .env.local
+          echo "NEXT_PUBLIC_STORAGE_FIXED_QUOTA=${{ secrets.NEXT_PUBLIC_STORAGE_FIXED_QUOTA }}" >> .env.local
+          echo "NEXT_PUBLIC_TRANSLATION_FIXED_QUOTA=${{ secrets.NEXT_PUBLIC_TRANSLATION_FIXED_QUOTA }}" >> .env.local
+          echo "NEXT_PUBLIC_API_BASE_URL=${{ secrets.NEXT_PUBLIC_API_BASE_URL }}" >> .env.local
+          echo "NEXT_PUBLIC_OBJECT_STORAGE_TYPE=${{ secrets.NEXT_PUBLIC_OBJECT_STORAGE_TYPE }}" >> .env.local
+          echo "R2_ACCESS_KEY_ID=${{ secrets.R2_ACCESS_KEY_ID }}" >> .env.local
+          echo "R2_SECRET_ACCESS_KEY=${{ secrets.R2_SECRET_ACCESS_KEY }}" >> .env.local
+          echo "R2_BUCKET_NAME=${{ secrets.R2_BUCKET_NAME || 'readest' }}" >> .env.local
+          echo "R2_ACCOUNT_ID=${{ secrets.R2_ACCOUNT_ID }}" >> .env.local
+          echo "R2_REGION=${{ secrets.R2_REGION }}" >> .env.local
+          cp .env.local apps/readest-app/.env.local
+
+          # Hot-patch upstream bug where quota is not prefixed with NEXT_PUBLIC_
+          sed -i "s/process.env\\['STORAGE_FIXED_QUOTA'\\]/process.env\\['NEXT_PUBLIC_STORAGE_FIXED_QUOTA'\\]/g" apps/readest-app/src/utils/access.ts
+          sed -i "s/process.env\\['TRANSLATION_FIXED_QUOTA'\\]/process.env\\['NEXT_PUBLIC_TRANSLATION_FIXED_QUOTA'\\]/g" apps/readest-app/src/utils/access.ts
+
+      - name: disable tauri updater artifacts
+        if: env.SKIP_BUILD != 'true'
+        run: |
+          cd apps/readest-app/src-tauri
+          node -e "const fs = require('fs'); const config = JSON.parse(fs.readFileSync('tauri.conf.json')); config.bundle.createUpdaterArtifacts = false; fs.writeFileSync('tauri.conf.json', JSON.stringify(config, null, 2));"
+
+      - name: Build Android App (APK)
+        if: env.SKIP_BUILD != 'true'
+        env:
+          NODE_OPTIONS: '--max-old-space-size=8192'
+          NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/28.2.13676358
+        run: |
+          cd apps/readest-app
+          rm -rf src-tauri/gen/android
+          pnpm tauri android init
+          pnpm tauri icon ../../data/icons/readest-book.png
+          git checkout .
+          
+          pushd src-tauri/gen/android
+          echo "keyAlias=${{ secrets.ANDROID_KEY_ALIAS }}" > keystore.properties
+          echo "password=${{ secrets.ANDROID_KEY_PASSWORD }}" >> keystore.properties
+          base64 -d <<< "${{ secrets.ANDROID_KEY_BASE64 }}" > $RUNNER_TEMP/keystore.jks
+          echo "storeFile=$RUNNER_TEMP/keystore.jks" >> keystore.properties
+          popd
+
+          pnpm tauri android build
+
+      - name: Upload APK to R2
+        if: env.SKIP_BUILD != 'true'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          R2_BUCKET: ${{ secrets.R2_BUCKET_NAME || 'readest' }}
+          TARGET_TAG: ${{ env.TARGET_TAG }}
+        run: |
+          cd apps/readest-app
+          apk_path=src-tauri/gen/android/app/build/outputs/apk/universal/release
+          universal_apk=Readest_${TARGET_TAG}_universal.apk
+          arm64_apk=Readest_${TARGET_TAG}_arm64.apk
+          
+          if [ ! -f "${apk_path}/app-universal-release.apk" ]; then
+            echo "=== APK not found! ==="
+            exit 1
+          fi
+          
+          cp ${apk_path}/app-universal-release.apk $universal_apk
+          
+          # 删除旧版本 APK
+          aws s3 rm "s3://${R2_BUCKET}/releases/" --recursive --exclude "*" --include "Readest_*_universal.apk" --endpoint-url "$R2_ENDPOINT" || true
+          aws s3 rm "s3://${R2_BUCKET}/releases/" --recursive --exclude "*" --include "Readest_*_arm64.apk" --endpoint-url "$R2_ENDPOINT" || true
+          
+          # 上传新 APK
+          aws s3 cp "$universal_apk" "s3://${R2_BUCKET}/releases/$universal_apk" --endpoint-url "$R2_ENDPOINT"
